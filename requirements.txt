@@ -1,0 +1,43 @@
+# Core dependencies
+gradio>=4.0.0
+python-dotenv
+
+# LangChain ecosystem
+langchain
+langchain-core
+langchain-community
+langchain-google-genai
+langgraph
+langgraph-supervisor
+
+# MCP (optional for cloud)
+mcp[cli]
+langchain-mcp-adapters
+
+# Document processing
+PyPDF2
+python-docx
+python-pptx
+docx2txt
+PyMuPDF
+openpyxl
+
+# Vector store & embeddings
+chromadb
+sentence-transformers
+
+# API & Server
+fastapi
+uvicorn
+pydantic>=1.8.0
+python-multipart>=0.0.5
+
+# Utilities
+nest_asyncio
+SQLAlchemy
+
+# Optional: Only install on local (comment out for faster cloud builds)
+# langchain-ollama
+# streamlit
+# fastapi-mcp
+# langgraph-swarm

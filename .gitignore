@@ -1,0 +1,17 @@
+**/__pycache__/
+**/*.pyc
+node_modules/
+.env
+.env.local
+.env.*.local
+users.json
+*.db
+*.sqlite
+*.sqlite3
+logs/
+vector_store_google/
+__pycache__/
+*.log
+.DS_Store
+.vscode/
+.idea/

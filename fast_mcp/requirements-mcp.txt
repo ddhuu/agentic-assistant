@@ -1,0 +1,7 @@
+fastapi>=0.68.0
+uvicorn>=0.15.0
+pydantic>=1.8.0
+mcp>=0.1.0  # Assuming this is the MCP framework being used
+langchain>=0.1.0
+langgraph>=0.1.0
+python-multipart>=0.0.5

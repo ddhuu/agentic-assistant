@@ -1,0 +1,15 @@
+{
+    "special_files": {
+        "finance2023.pdf": [
+            "admin",
+            "accounting"
+        ],
+        "finance2024.pdf": [
+            "admin",
+            "accounting"
+        ],
+        "Admin.pdf": [
+            "admin"
+        ]
+    }
+}

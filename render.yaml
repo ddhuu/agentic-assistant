@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: ai-chatbot
+    env: python
+    region: singapore
+    plan: free
+    buildCommand: bash render-build.sh
+    startCommand: python app.py
+    envVars:
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: DEFAULT_ADMIN_USERNAME
+        value: admin
+      - key: DEFAULT_ADMIN_PASSWORD
+        generateValue: true
+      - key: APP_SECRET_KEY
+        generateValue: true
+      - key: DEBUG_MODE
+        value: "False"
+      - key: SERVER_HOST
+        value: "0.0.0.0"
+      - key: SERVER_PORT
+        value: "10000"
+      - key: DATA_DIR
+        value: "/opt/render/project/src/data"
+      - key: VECTOR_STORE_PATH
+        value: "/opt/render/project/src/vector_store_google"
+      - key: SESSION_TIMEOUT_MINUTES
+        value: "30"
+      - key: MAX_LOGIN_ATTEMPTS
+        value: "5"
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "60"
+      - key: CACHE_TTL_HOURS
+        value: "24"
+    disk:
+      name: data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
