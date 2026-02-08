@@ -39,6 +39,7 @@ class FilesystemAgent(BaseAgent):
         
             if mcp_client is None:
                 print("Creating new MCP client for FilesystemAgent")
+                data_path = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data"))
                 client = MultiServerMCPClient({
                     "document_search": {
                         "command": "cmd",
@@ -47,11 +48,13 @@ class FilesystemAgent(BaseAgent):
                             "npx",
                             "-y",
                             "@modelcontextprotocol/server-filesystem",
-                            "C:\\Users\\dhuu3\\Desktop\\local-classify-docs-ai-agent\\data",
+                            data_path,
                         ],
                         "transport": "stdio",
                     }
                 })
+                # Enter async context so MCP server process starts
+                await client.__aenter__()
             else:
                 print("Using provided MCP client for FilesystemAgent")
                 client = mcp_client

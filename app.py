@@ -528,6 +528,9 @@ class MultiAgentChatbot:
                 logger.warning(f"Chain of thought processing error: {cot_error}")
                 self.chain_of_thought = ["Chain of thought processing completed with minor issues"]
             
+            # Store eval results for display in chain of thought panel
+            self.eval_results = result.get("eval_results", {})
+            
             assistant_message = {"role": "assistant", "content": response_content}
             new_history.append(assistant_message)
             
@@ -1081,7 +1084,7 @@ label {
 
 # Create Gradio interface with enhanced UX flow
 # Note: In Gradio 6.0, theme and css moved to launch() method
-with gr.Blocks(title="🤖 Multi-Agent AI Chatbot") as demo:
+with gr.Blocks(title="🤖 Multi-Agent AI Chatbot", theme=gr.themes.Soft(), css=css) as demo:
     # Shared state variables
     current_user = gr.State(None)
     
@@ -1171,65 +1174,50 @@ with gr.Blocks(title="🤖 Multi-Agent AI Chatbot") as demo:
             # Main chat area
             with gr.Column(scale=3):
                 chatbot_interface = gr.Chatbot(
-                    label="🧠 Intelligence Interface",
+                    label="",
                     height=500,
                     show_label=True,
-                    elem_classes=["chatbot"]
+                    elem_classes=["chatbot"],
+                    type="messages"
                 )
                 
-                # Input area with improved alignment
-                with gr.Row():
+                # Input area - Send button aligned with textbox
+                with gr.Row(equal_height=True):
                     msg = gr.Textbox(
-                        label="💬 Your Message",
-                        placeholder="Ask me anything... I'm powered by advanced AI agents 🚀",
-                        scale=4,
-                        lines=2,
-                        max_lines=4
+                        label="",
+                        placeholder="Ask me anything...",
+                        scale=5,
+                        lines=1,
+                        max_lines=3,
+                        show_label=False
                     )
-                    with gr.Column(scale=1):
-                        send_btn = gr.Button("⚡ Send")
+                    send_btn = gr.Button("Send ⚡", scale=1, min_width=80)
                         
                 # Action buttons
                 with gr.Row():
                     clear_btn = gr.Button("🗑️ Clear Chat")
                     logout_btn = gr.Button("🚪 Logout")
-                
-                # File Upload Section
-                with gr.Accordion("📁 Upload Documents", open=False):
-                    gr.Markdown("Upload documents (PDF, DOCX, PPTX, TXT, etc.) to enhance the AI's knowledge base")
-                    file_upload = gr.File(
-                        label="Select Files",
-                        file_count="multiple",
-                        file_types=[".pdf", ".docx", ".doc", ".pptx", ".ppt", ".txt", ".md", ".csv", ".xlsx", ".xls"]
-                    )
-                    upload_btn = gr.Button("📤 Upload Files")
-                    upload_status = gr.Markdown("")
                     
             # AI Processing Pipeline Panel
-            with gr.Column(scale=1):
-                with gr.Group(elem_classes=["control-panel"]):
-                    gr.HTML("""
-                    <div style="text-align: center; margin-bottom: 1.5rem;">
-                        <h3 style="margin: 0; display: flex; align-items: center; justify-content: center; gap: 0.5rem; font-size: 1.3rem;">
-                            🧠 AI Processing Pipeline
-                        </h3>
+            with gr.Column(scale=1, min_width=280):
+                gr.HTML("""
+                <div style="padding: 12px 16px; background: rgba(255,255,255,0.05); border-radius: 12px; border: 1px solid rgba(255,255,255,0.1);">
+                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.1);">
+                        <span style="font-size: 1.2rem;">⚙️</span>
+                        <span style="font-size: 0.95rem; font-weight: 600; color: #e2e8f0;">Processing Pipeline</span>
                     </div>
-                    """)
-                    
-                    # Processing visualization
-                    chain_display = gr.HTML(
-                        """
-                        <div class="processing-container">
-                            <div class="steps-list">
-                                <div class="step-item">
-                                    <span class="step-icon">🔮</span>
-                                    <span class="step-content">Ready for Intelligence Processing</span>
-                                </div>
-                            </div>
-                        </div>
-                        """,
-                        elem_classes=["processing-container"]
-                    )
+                </div>
+                """)
+                
+                # Processing visualization
+                chain_display = gr.HTML(
+                    """
+                    <div style="padding: 8px 12px; font-size: 0.85rem; color: #94a3b8;">
+                        Ready for your question...
+                    </div>
+                    """,
+                    elem_classes=["processing-container"]
+                )
     
     # Enhanced event handlers
     def handle_login(username_input, password_input):
@@ -1337,7 +1325,7 @@ with gr.Blocks(title="🤖 Multi-Agent AI Chatbot") as demo:
                 return history, format_chain_display([]), ""
             
             new_history, chain, empty_msg = chatbot.process_message(message, history, current_user=current_user)
-            formatted_chain = format_chain_display(chain)
+            formatted_chain = format_chain_display(chain, eval_results=getattr(chatbot, 'eval_results', {}))
             return new_history, formatted_chain, empty_msg
         except Exception as e:
             logger.error(f"Send message error: {e}")
@@ -1345,38 +1333,42 @@ with gr.Blocks(title="🤖 Multi-Agent AI Chatbot") as demo:
             error_history = history + [{"role": "assistant", "content": error_msg}] if history else [{"role": "assistant", "content": error_msg}]
             return error_history, format_chain_display([f"❌ Error: {str(e)}"]), ""
     
-    def format_chain_display(chain_of_thought):
-        """Format chain of thought for modern display"""
+    def format_chain_display(chain_of_thought, eval_results=None):
+        """Format chain of thought for modern display with quality scores"""
         if not chain_of_thought:
             return """
-            <div class="processing-container">
-                <div class="steps-list">
-                    <div class="step-item">
-                        <span class="step-icon">🔮</span>
-                        <span class="step-content">Ready for Intelligence Processing</span>
-                    </div>
-                </div>
+            <div style="padding: 8px 12px; font-size: 0.85rem; color: #94a3b8;">
+                Ready for your question...
             </div>
             """
         
         steps_html = []
-        icons = ["🔍", "🧠", "⚡", "🎯", "✨", "🚀"]
         
         for i, step in enumerate(chain_of_thought):
             step_str = safe_str_conversion(step)
-            icon = icons[i % len(icons)]
+            # Truncate long steps for sidebar
+            if len(step_str) > 120:
+                step_str = step_str[:117] + "..."
             steps_html.append(f"""
-                <div class='step-item'>
-                    <span class='step-icon'>{icon}</span>
-                    <span class='step-content'>{step_str}</span>
+                <div style="display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05);">
+                    <span style="color: #60a5fa; font-weight: 600; min-width: 20px; font-size: 0.8rem;">{i+1}.</span>
+                    <span style="color: #cbd5e1; font-size: 0.82rem; line-height: 1.4; word-break: break-word;">{step_str}</span>
                 </div>
             """)
         
+        # Add eval results if available
+        eval_html = ""
+        if eval_results:
+            try:
+                from config.opik_eval import format_eval_results_html
+                eval_html = format_eval_results_html(eval_results)
+            except Exception:
+                pass
+        
         return f"""
-        <div class='processing-container'>
-            <div class='steps-list'>
-                {''.join(steps_html)}
-            </div>
+        <div style="padding: 4px 12px; max-height: 450px; overflow-y: auto;">
+            {''.join(steps_html)}
+            {eval_html}
         </div>
         """
     
@@ -1473,12 +1465,6 @@ with gr.Blocks(title="🤖 Multi-Agent AI Chatbot") as demo:
         outputs=[chain_display]
     )
     
-    # File upload handling
-    upload_btn.click(
-        handle_file_upload,
-        inputs=[file_upload],
-        outputs=[upload_status]
-    )
 
 if __name__ == "__main__":
     import threading
@@ -1499,7 +1485,7 @@ if __name__ == "__main__":
             print("🔧 Initializing AI agents in background...")
             try:
                 # This will trigger lazy initialization on first use
-                chatbot.initialize()
+                chatbot.initialize_system()
                 print("✅ AI agents initialized successfully")
             except Exception as e:
                 print(f"⚠️ Agent initialization warning: {e}")
@@ -1518,10 +1504,7 @@ if __name__ == "__main__":
         demo.launch(
             server_name="0.0.0.0",  # Must be 0.0.0.0 for Render to detect
             server_port=port,
-            share=False,
-            # Gradio 6.0: theme and css moved here from Blocks()
-            theme=gr.themes.Soft(),
-            css=css
+            share=True,
         )
         
         print(f"✅ Gradio app is running on port {port}")

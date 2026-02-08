@@ -41,3 +41,7 @@ SQLAlchemy
 # streamlit
 # fastapi-mcp
 # langgraph-swarm
+
+
+# opik
+opik

@@ -9,6 +9,33 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from typing_extensions import AsyncGenerator
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Opik tracing for agent workflows
+import os as _os
+_OPIK_PROJECT = _os.getenv("OPIK_PROJECT_NAME", "agentic-assistant")
+try:
+    import opik
+    from opik import track as _opik_track_raw
+    HAS_OPIK = True
+    
+    # Wrapper that always injects the correct project_name so every span
+    # lands in the same project as the OpikTracer callback on the LLM,
+    # preventing the "nested span under a different project" warning.
+    def opik_track(name: str = None, **kwargs):
+        kwargs.setdefault("project_name", _OPIK_PROJECT)
+        if name:
+            kwargs["name"] = name
+        return _opik_track_raw(**kwargs)
+        
+except ImportError:
+    HAS_OPIK = False
+    def opik_track(*args, **kwargs):
+        """No-op decorator when opik is not installed"""
+        def decorator(func):
+            return func
+        if args and callable(args[0]):
+            return args[0]
+        return decorator
+
 from utils.logger import log
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -73,6 +100,7 @@ class ReflectionAgent:
         """Initialize the ReflectionAgent."""
         self.model = gemini
     
+    @opik_track(name="reflect_and_respond")
     async def reflect_and_respond(self, state: AgentState) -> str:
         """
         Phân tích kết quả từ các agent và tạo câu trả lời cuối cùng có ngữ nghĩa tốt.
@@ -96,39 +124,40 @@ class ReflectionAgent:
                 # Create specialized reflection for data analysis
                 original_query = state.get("original_query", "")
                 extracted_contents = state.get("extracted_contents", {})
+                report = analysis_results.get('report', '')
                 
-                reflection_prompt = f"""
-                Bạn là một AI assistant chuyên về tổng hợp kết quả phân tích dữ liệu tài chính.
+                # Check if the report contains actual data or is empty/garbage
+                _report_has_no_real_data = (
+                    not report
+                    or "Vui lòng cung cấp" in report
+                    or "không thể trực tiếp truy cập" in report
+                    or "Extract text from" in report
+                    or len(report.strip()) < 50
+                )
                 
-                YÊU CẦU BAN ĐẦU CỦA NGƯỜI DÙNG:
-                "{original_query}"
+                if _report_has_no_real_data:
+                    return "⚠️ Unable to analyze data because file content was not successfully extracted. Please try again."
                 
-                KẾT QUẢ PHÂN TÍCH DỮ LIỆU:
-                {analysis_results.get('report', 'Không có báo cáo phân tích')}
-                
-                CÁC CÔNG CỤ ĐÃ SỬ DỤNG:
-                {', '.join(used_tools)}
-                
-                SỐ LƯỢNG FILE ĐƯỢC PHÂN TÍCH:
-                {len(extracted_contents)} files
-                
-                YÊU CẦU:
-                Hãy tạo một câu trả lời ngắn gọn, tự nhiên và hữu ích tóm tắt kết quả so sánh dữ liệu tài chính.
-                
-                HƯỚNG DẪN TRẢ LỜI:
-                1. Xác nhận đã so sánh dữ liệu từ các file thành công
-                2. Tóm tắt các xu hướng chính (tăng/giảm)
-                3. Đưa ra nhận xét về hiệu suất kinh doanh
-                4. Sử dụng ngôn ngữ dễ hiểu, tránh thuật ngữ phức tạp
-                
-                LƯU Ý QUAN TRỌNG:
-                - Tập trung vào những thông tin quan trọng nhất
-                - Sử dụng ngôn ngữ tự nhiên, gần gũi
-                - Giới hạn trong 3-4 câu
-                - Đảm bảo câu trả lời có giá trị và actionable
-                
-                CÂU TRẢ LỜI (chỉ trả về câu trả lời, không có phần giải thích):
-                """
+                reflection_prompt = f"""You are an AI assistant specializing in summarizing financial data analysis results.
+
+ORIGINAL USER REQUEST:
+"{original_query}"
+
+DATA ANALYSIS RESULTS:
+{report}
+
+NUMBER OF FILES ANALYZED:
+{len(extracted_contents)} files
+
+INSTRUCTIONS:
+1. Summarize key trends (increase/decrease) with SPECIFIC NUMBERS from the report
+2. DO NOT fabricate data - only use data present in the report
+3. Limit to 3-4 sentences
+4. Use natural, easy-to-understand language
+
+Always respond in English.
+
+RESPONSE (return only the response, no explanation):"""
                 
                 response = await self.model.ainvoke(reflection_prompt)
                 return "💰 " + response.content.strip()
@@ -141,27 +170,27 @@ class ReflectionAgent:
                 if state.get("stop_reason") == "access_denied":
                     # Tạo prompt đặc biệt cho trường hợp quyền truy cập bị từ chối
                     access_denied_prompt = f"""
-                    Bạn là một AI assistant chuyên về tổng hợp kết quả và trả lời người dùng một cách tự nhiên, thân thiện.
+                    You are an AI assistant that summarizes results and responds naturally and helpfully.
                     
-                    YÊU CẦU BAN ĐẦU CỦA NGƯỜI DÙNG:
+                    ORIGINAL USER REQUEST:
                     "{state.get('original_query', '')}"  
                     
-                    TÌNH HUỐNG:
-                    Đã tìm thấy các file phù hợp với yêu cầu, nhưng người dùng không có quyền truy cập vào các file này.
+                    SITUATION:
+                    Matching files were found, but the user does not have access permissions.
                     
-                    YÊU CẦU:
-                    Hãy tạo một câu trả lời ngắn gọn, tự nhiên và hữu ích thông báo cho người dùng rằng:
-                    1. Đã tìm thấy file phù hợp với yêu cầu của họ
-                    2. Tuy nhiên, họ không có quyền truy cập vào các file này
-                    3. Họ cần có quyền truy cập phù hợp để xem nội dung
+                    INSTRUCTIONS:
+                    Create a concise, natural response informing the user that:
+                    1. Matching files were found for their request
+                    2. However, they do not have access to these files
+                    3. They need appropriate permissions to view the content
                     
-                    LƯU Ý QUAN TRỌNG:
-                    - Sử dụng ngôn ngữ tự nhiên, gần gũi
-                    - Giới hạn trong 2-3 câu
-                    - Không cần giải thích thêm sau câu trả lời
-                    - KHÔNG đề cập đến việc phân loại file hoặc lưu metadata vì quá trình đã dừng lại
+                    IMPORTANT:
+                    - Use natural, friendly language
+                    - Limit to 2-3 sentences
+                    - Do NOT mention file classification or metadata saving
+                    - Always respond in English
                     
-                    CÂU TRẢ LỜI (chỉ trả về câu trả lời, không có phần giải thích):
+                    RESPONSE (return only the response):
                     """
                     
                     # Gọi LLM để tạo phản hồi cho trường hợp quyền truy cập bị từ chối
@@ -170,23 +199,23 @@ class ReflectionAgent:
                 else:
                     # Xử lý các trường hợp dừng khác
                     error_prompt = f"""
-                    Bạn là một AI assistant chuyên về tổng hợp kết quả và trả lời người dùng một cách tự nhiên, thân thiện.
+                    You are an AI assistant that summarizes results and responds naturally and helpfully.
                     
-                    YÊU CẦU BAN ĐẦU CỦA NGƯỜI DÙNG:
+                    ORIGINAL USER REQUEST:
                     "{state.get('original_query', '')}"  
                     
-                    TÌNH HUỐNG:
-                    Đã xảy ra lỗi trong quá trình xử lý: {state.get('stop_reason', 'Lỗi không xác định')}
+                    SITUATION:
+                    An error occurred during processing: {state.get('stop_reason', 'Unknown error')}
                     
-                    YÊU CẦU:
-                    Hãy tạo một câu trả lời ngắn gọn, tự nhiên và hữu ích thông báo cho người dùng về lỗi đã xảy ra.
+                    INSTRUCTIONS:
+                    Create a concise, natural response informing the user about the error.
                     
-                    LƯU Ý QUAN TRỌNG:
-                    - Sử dụng ngôn ngữ tự nhiên, gần gũi
-                    - Giới hạn trong 2-3 câu
-                    - Không cần giải thích thêm sau câu trả lời
+                    IMPORTANT:
+                    - Use natural, friendly language
+                    - Limit to 2-3 sentences
+                    - Always respond in English
                     
-                    CÂU TRẢ LỜI (chỉ trả về câu trả lời, không có phần giải thích):
+                    RESPONSE (return only the response):
                     """
                     
                     # Gọi LLM để tạo phản hồi cho trường hợp lỗi khác
@@ -236,11 +265,13 @@ class ReflectionAgent:
                     "Tìm thấy các file sau:", 
                     "Đã tìm thấy các file:",
                     "Tìm thấy nhiều file:",
+                    "I found the file:",
+                    "I found the following files:",
                     "files found:",
                     "found files:",
                     "kết quả tìm kiếm:",
                     "search results:",
-                    "plan-"  # Thêm dấu hiệu tìm kiếm file có chứa "plan"
+                    "plan-"
                 ]
                 
                 # Kiểm tra nếu có bất kỳ indicator nào trong nội dung
@@ -373,13 +404,13 @@ class ReflectionAgent:
                         file_found = f"{file_count} files: {', '.join(file_names)}"
                     elif not isinstance(actual_files, str):
                         file_names = [os.path.basename(f) for f in actual_files[:2]]
-                        file_found = f"{file_count} files: {', '.join(file_names)} và {file_count - 2} file khác"
+                        file_found = f"{file_count} files: {', '.join(file_names)} and {file_count - 2} more"
                     
                     # Thêm thông tin về số lượng file vào key_findings
                     if file_count == 1:
-                        key_findings.append(f"Đã tìm thấy 1 file")
+                        key_findings.append(f"Found 1 file")
                     else:
-                        key_findings.append(f"Đã tìm thấy {file_count} files")
+                        key_findings.append(f"Found {file_count} files")
                     
                     # Log thông tin về file
                     if isinstance(actual_files, str):
@@ -389,9 +420,8 @@ class ReflectionAgent:
                         log(f"ReflectionAgent: Đã tìm thấy {file_count} files: {', '.join(file_names)}...")
                 
                 # Kết quả từ Text Extraction agent
-                elif "📝" in content and ("Kết quả trích xuất từ file" in content or "Kết quả trích xuất từ các file" in content):
-                    # Kiểm tra xem có phải là trích xuất nhiều file không
-                    is_multi_extraction = "Kết quả trích xuất từ các file" in content or "trích xuất nhiều file" in content.lower()
+                elif "📝" in content and ("Kết quả trích xuất từ file" in content or "Kết quả trích xuất từ các file" in content or "Extraction result from file" in content or "Extraction result from" in content):
+                    is_multi_extraction = "Kết quả trích xuất từ các file" in content or "trích xuất nhiều file" in content.lower() or "Extraction result from" in content and "files" in content
                     
                     # Lấy nội dung trích xuất từ text_extraction_results trong state nếu có
                     extracted_content = ""
@@ -458,15 +488,15 @@ class ReflectionAgent:
                     
                     # Thêm kết quả vào key_findings
                     if is_multi_extraction or file_count > 1:
-                        key_findings.append(f"Đã trích xuất nội dung từ {file_count} files")
+                        key_findings.append(f"Extracted content from {file_count} files")
                     else:
-                        key_findings.append(f"Đã trích xuất nội dung từ file")
+                        key_findings.append(f"Extracted content from file")
                         
                     # Lưu nội dung trích xuất vào state để sử dụng trong reflection
                     state["extracted_content_preview"] = extraction_result
                 
                 # Kết quả từ File Classification agent
-                elif "🏷️" in content and "Kết quả phân loại file" in content:
+                elif "🏷️" in content and ("Kết quả phân loại file" in content or "File classification result" in content or "Classification result" in content):
                     # Kiểm tra xem có phải là phân loại nhiều file không
                     is_multi_classification = "nhiều file" in content.lower() or "các file" in content.lower()
                     
@@ -540,25 +570,23 @@ class ReflectionAgent:
                             unique_classifications = list(set(classifications))
                             classification_result = f"{', '.join(unique_classifications[:3])}"
                             if len(unique_classifications) > 3:
-                                classification_result += f" và {len(unique_classifications) - 3} loại khác"
-                            key_findings.append(f"Đã phân loại {actual_file_count} files: {classification_result}")
+                                classification_result += f" and {len(unique_classifications) - 3} more types"
+                            key_findings.append(f"Classified {actual_file_count} files: {classification_result}")
                         else:
-                            # Fallback nếu không tìm thấy chi tiết phân loại
-                            label_pattern = r'Kết quả phân loại file[^:]*:\s*([^\n\r]+)'
+                            label_pattern = r'(?:Kết quả phân loại file|File classification result|Classification result)[^:]*:\s*([^\n\r]+)'
                             label_matches = re.findall(label_pattern, content)
                             if label_matches:
                                 classification_result = label_matches[0].strip()
-                                key_findings.append(f"Đã phân loại {actual_file_count} files: {classification_result}")
+                                key_findings.append(f"Classified {actual_file_count} files: {classification_result}")
                     else:
-                        # Xử lý phân loại đơn file
-                        label_pattern = r'Kết quả phân loại file[^:]*:\s*([^\n\r]+)'
+                        label_pattern = r'(?:Kết quả phân loại file|File classification result|Classification result)[^:]*:\s*([^\n\r]+)'
                         label_matches = re.findall(label_pattern, content)
                         if label_matches:
                             classification_result = label_matches[0].strip()
-                            key_findings.append(f"Đã phân loại file: {classification_result}")
+                            key_findings.append(f"Classified file: {classification_result}")
                 
                 # Kết quả từ Metadata agent
-                elif "📋" in content and "Đã lưu metadata thành công" in content:
+                elif "📋" in content and ("Đã lưu metadata thành công" in content or "Metadata saved successfully" in content or "metadata saved" in content.lower()):
                     # Kiểm tra xem có phải là lưu metadata cho nhiều file không
                     is_multi_file_metadata = "nhiều file" in content.lower() or "các file" in content.lower()
                     
@@ -600,11 +628,11 @@ class ReflectionAgent:
                     
                     if id_matches:
                         if is_multi_file_metadata or file_count > 1:
-                            key_findings.append(f"Đã lưu metadata cho {file_count} files với ID: {', '.join(metadata_ids[:3])}")
+                            key_findings.append(f"Saved metadata for {file_count} files with ID: {', '.join(metadata_ids[:3])}")
                             if len(metadata_ids) > 3:
-                                key_findings[-1] += f" và {len(metadata_ids) - 3} ID khác"
+                                key_findings[-1] += f" and {len(metadata_ids) - 3} more"
                         else:
-                            key_findings.append(f"Đã lưu metadata với ID: {metadata_ids[0]}")
+                            key_findings.append(f"Saved metadata with ID: {metadata_ids[0]}")
                             
                     # Cập nhật thông tin metadata cho các file chưa có metadata_id
                     if len(metadata_ids) == 1 and detailed_files:
@@ -623,14 +651,14 @@ class ReflectionAgent:
                 for file_info_item in detailed_files[:3]:  # Giới hạn hiển thị chi tiết 3 file đầu tiên
                     file_detail = f"File: {file_info_item['file_name']}"
                     if file_info_item.get("label"):
-                        file_detail += f", Phân loại: {file_info_item['label']}"
+                        file_detail += f", Classification: {file_info_item['label']}"
                     if file_info_item.get("metadata_id"):
                         file_detail += f", Metadata ID: {file_info_item['metadata_id']}"
                     file_list.append(file_detail)
                 
-                file_info = f"Đã tìm thấy {len(detailed_files)} files:\n- " + "\n- ".join(file_list)
+                file_info = f"Found {len(detailed_files)} files:\n- " + "\n- ".join(file_list)
                 if len(detailed_files) > 3:
-                    file_info += f"\n- và {len(detailed_files) - 3} file khác"
+                    file_info += f"\n- and {len(detailed_files) - 3} more files"
             elif file_found:
                 file_count = 1  # Nếu có file_found, có ít nhất 1 file
                 if "files:" in file_found.lower() or "file:" in file_found.lower():
@@ -665,62 +693,55 @@ class ReflectionAgent:
                     extracted_content = extracted_content[:1000] + "..."
                 log(f"Found extracted content in agent_results: {len(extracted_content)} characters")
             
-            # Tạo prompt với thông tin rõ ràng hơn và số lượng file chính xác
             reflection_prompt = f"""
-            Bạn là một AI assistant chuyên về tổng hợp kết quả và trả lời người dùng một cách tự nhiên, thân thiện.
+            You are an AI assistant that summarizes results and responds naturally and helpfully.
             
-            YÊU CẦU BAN ĐẦU CỦA NGƯỜI DÙNG:
+            ORIGINAL USER REQUEST:
             "{original_query}"
             
-            CÁC CÔNG CỤ ĐÃ SỬ DỤNG:
-            {', '.join(used_tools) if used_tools else 'Không có'}
+            TOOLS USED:
+            {', '.join(used_tools) if used_tools else 'None'}
             
-            KẾT QUẢ CHÍNH:
-            {chr(10).join(f"- {finding}" for finding in key_findings) if key_findings else "- Không có kết quả nào được ghi nhận"}
+            KEY FINDINGS:
+            {chr(10).join(f"- {finding}" for finding in key_findings) if key_findings else "- No results recorded"}
             
-            THÔNG TIN CHI TIẾT VỀ FILE:
-            {file_info if file_info else "- Không tìm thấy file nào phù hợp"}
+            FILE DETAILS:
+            {file_info if file_info else "- No matching files found"}
             
-            SỐ LƯỢNG FILE CHÍNH XÁC: {file_count}
+            EXACT FILE COUNT: {file_count}
             
-            # Không hiển thị nội dung trích xuất trong prompt
-            # {f"NỘI DUNG TRÍCH XUẤT:\n{extracted_content}" if extracted_content and "text_extraction" in used_tools else ""}
+            SPECIAL NOTES:
+            {'Metadata agent was used to save metadata. Mention this in your response.' if metadata_agent_used else 'Do NOT mention metadata saving as it was not used.'}
+            {'Do NOT mention text extraction in your response.' if "text_extraction" in used_tools else 'Do NOT mention extracted content if none exists.'}
             
-            LƯU Ý ĐẶC BIỆT:
-            {'Đã sử dụng metadata agent để lưu metadata. Hãy đề cập đến việc đã lưu metadata trong phản hồi của bạn.' if metadata_agent_used else 'KHÔNG đề cập đến việc lưu metadata trong phản hồi của bạn vì metadata agent không được sử dụng.'}
-            {'KHÔNG đề cập đến việc trích xuất nội dung trong phản hồi của bạn.' if "text_extraction" in used_tools else 'KHÔNG đề cập đến nội dung trích xuất nếu không có.'}
-            
-            YÊU CẦU:
-            Hãy tạo một câu trả lời ngắn gọn, tự nhiên và hữu ích dựa trên thông tin trên.
-            
-            HƯỚNG DẪN TRẢ LỜI:
-            1. Nếu đã tìm thấy file:
-               - Xác nhận đã tìm thấy file thành công
-               - Liệt kê tên các file chính (nếu ít hơn 5 file) hoặc số lượng file (nếu nhiều hơn 5)
-               - QUAN TRỌNG: Nếu có kết quả phân loại, LUÔN đề cập đến việc các file được phân loại là gì
-               - Mô tả ngắn gọn về các file đã tìm thấy
+            RESPONSE GUIDELINES:
+            1. If files were found:
+               - Confirm files were found successfully
+               - List main file names (if fewer than 5) or file count (if more than 5)
+               - IMPORTANT: If classification results exist, ALWAYS mention what the files were classified as
+               - Brief description of found files
                 
-            2. Nếu không tìm thấy file:
-               - Thông báo không tìm thấy file phù hợp
-               - Đề xuất các từ khóa tìm kiếm khác nếu có thể
+            2. If no files found:
+               - Inform that no matching files were found
+               - Suggest alternative search keywords if possible
             
-            3. Nếu có lỗi hoặc vấn đề:
-               - Giải thích ngắn gọn vấn đề
-               - Đề xuất hướng khắc phục nếu có
+            3. If there were errors:
+               - Briefly explain the issue
+               - Suggest a fix if possible
                
-            4. Nếu đã trích xuất nội dung:
-                - KHÔNG đề cập đến việc trích xuất nội dung trong phản hồi
-                - Tập trung vào kết quả phân loại hoặc tìm kiếm hoặc save metadata tùy vào yêu cầu của người dùng
+            4. If content was extracted:
+                - Do NOT mention text extraction in the response
+                - Focus on classification, search results, or metadata saving based on user request
             
-            LƯU Ý QUAN TRỌNG:
-            - Luôn đề cập đến các file đã tìm thấy nếu có
-            - LUÔN đề cập đến kết quả phân loại file nếu có (ví dụ: "Hai file đều được phân loại là tài chính")
-            - Sử dụng ngôn ngữ tự nhiên, gần gũi
-            - Giới hạn trong 2-3 câu 
-            - KHÔNG đề cập đến việc trích xuất nội dung trong phản hồi
-            - Không cần giải thích thêm sau câu trả lời
+            IMPORTANT:
+            - Always mention found files if any
+            - ALWAYS mention file classification results if available
+            - Use natural, friendly language
+            - Limit to 2-3 sentences
+            - Do NOT mention text extraction in the response
+            - Always respond in English
             
-            CÂU TRẢ LỜI (chỉ trả về câu trả lời, không có phần giải thích):
+            RESPONSE (return only the response):
             """
             
             # Gọi LLM để tạo reflection response
@@ -769,7 +790,7 @@ class ReflectionAgent:
                 if detailed_files:
                     file_names = [f_info["file_name"] for f_info in detailed_files[:3]]
                     if len(detailed_files) > 3:
-                        file_names.append(f"và {len(detailed_files) - 3} file khác")
+                        file_names.append(f"and {len(detailed_files) - 3} more files")
                 
                 # Thử lại với prompt rõ ràng hơn
                 if file_count == 1:
@@ -778,22 +799,24 @@ class ReflectionAgent:
                     enhanced_prompt = f"""
                     {reflection_prompt}
                     
-                    LƯU Ý ĐẶC BIỆT: 
-                    Bạn đã tìm thấy CHÍNH XÁC 1 FILE, không phải nhiều file.
-                    File này là: {file_name}
-                    Hãy đảm bảo đề cập đến việc tìm thấy CHỈ MỘT file trong câu trả lời của bạn.
-                    KHÔNG được đề cập đến nhiều file trong câu trả lời.
+                    SPECIAL NOTE: 
+                    You found EXACTLY 1 FILE, not multiple files.
+                    The file is: {file_name}
+                    Make sure to mention finding ONLY ONE file in your response.
+                    Do NOT mention multiple files in your response.
+                    Always respond in English.
                     """
                 else:
                     # Nếu có nhiều file
                     enhanced_prompt = f"""
                     {reflection_prompt}
                     
-                    LƯU Ý ĐẶC BIỆT: 
-                    Bạn đã tìm thấy CHÍNH XÁC {file_count} FILE, không phải nhiều hơn hay ít hơn.
-                    Các file bao gồm: {', '.join(file_names) if file_names else file_found}
-                    Hãy đảm bảo đề cập đến việc tìm thấy CHÍNH XÁC {file_count} FILE trong câu trả lời của bạn và liệt kê tên file.
-                    KHÔNG được đề cập đến số lượng file khác với {file_count}.
+                    SPECIAL NOTE: 
+                    You found EXACTLY {file_count} FILES, not more or fewer.
+                    The files include: {', '.join(file_names) if file_names else file_found}
+                    Make sure to mention finding EXACTLY {file_count} FILES in your response and list the file names.
+                    Do NOT mention a different number of files than {file_count}.
+                    Always respond in English.
                     """
                 
                 try:
@@ -824,7 +847,7 @@ class ReflectionAgent:
         except Exception as e:
             log(f"Error in reflection agent: {str(e)}", level='error')
             # Fallback response
-            return f"Tôi đã hoàn thành yêu cầu của bạn. Đã sử dụng {len(state.get('used_tools', []))} công cụ để xử lý và đạt được kết quả mong muốn."
+            return f"I have completed your request. Used {len(state.get('used_tools', []))} tools to process and achieve the desired results."
 
 class MultiAgentSystem:
     """
@@ -865,7 +888,8 @@ class MultiAgentSystem:
             # Skip on cloud deployment (Render, Railway, etc.)
             try:
                 print("Attempting to initialize FilesystemAgent with MCP...")
-                mcp_client = MultiServerMCPClient({
+                data_path = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data"))
+                self._mcp_client = MultiServerMCPClient({
                     "document_search": {
                         "command": "cmd",
                         "args": [
@@ -873,28 +897,43 @@ class MultiAgentSystem:
                             "npx",
                             "-y",
                             "@modelcontextprotocol/server-filesystem",
-                            "C:\\Users\\dhuu3\\Desktop\\local-classify-docs-ai-agent\\data"  # Adjusted path,
+                            data_path,
                         ],
                         "transport": "stdio"
                     }
                 })
-                print("Using provided MCP client for FilesystemAgent")
-                self.agents["filesystem"] = await FilesystemAgent.create(mcp_client=mcp_client)
+                # Enter the async context manager so the MCP server process starts
+                await self._mcp_client.__aenter__()
+                print(f"MCP client connected (data path: {data_path})")
+                self.agents["filesystem"] = await FilesystemAgent.create(mcp_client=self._mcp_client)
                 print("FilesystemAgent initialized successfully")
             except Exception as e:
                 print(f" FilesystemAgent initialization failed (expected on cloud): {e}")
                 print("Continuing without FilesystemAgent - RAG Agent will handle file search")
                 # FilesystemAgent is optional - RAG can handle file search
             
-            self.agents["metadata"] = MetadataAgent()
-            self.agents["text_extraction"] = TextExtractionAgent()
-            self.agents["file_classification"] = FileClassificationAgent()
-            self.agents["rag"] = RAGAgent()
-            self.agents["data_analysis"] = DataAnalysisAgent()
-            # Build RAG index for data directory
-            data_dir = "C:\\Users\\dhuu3\\Desktop\\local-classify-docs-ai-agent\\data"
-            await self.agents["rag"].build_index(data_dir)
-            print("All specialized agents initialized successfully")
+            # Check if running in minimal mode (for low-memory environments like Render free tier)
+            minimal_mode = os.getenv("MINIMAL_MODE", "false").lower() == "true"
+            
+            if minimal_mode:
+                print("🔧 Running in MINIMAL MODE (optimized for 512MB RAM)")
+                # Only initialize lightweight agents
+                self.agents["metadata"] = MetadataAgent()
+                self.agents["text_extraction"] = TextExtractionAgent()
+                self.agents["file_classification"] = FileClassificationAgent()
+                print("✅ Minimal agents initialized (Metadata, TextExtraction, FileClassification)")
+                print("⚠️ RAG and DataAnalysis agents disabled to save memory")
+            else:
+                print("🚀 Running in FULL MODE (all agents enabled)")
+                self.agents["metadata"] = MetadataAgent()
+                self.agents["text_extraction"] = TextExtractionAgent()
+                self.agents["file_classification"] = FileClassificationAgent()
+                self.agents["rag"] = RAGAgent()
+                self.agents["data_analysis"] = DataAnalysisAgent()
+                # Build RAG index for data directory
+                data_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data"))
+                await self.agents["rag"].build_index(data_dir)
+                print("✅ All specialized agents initialized successfully")
             
             # Collect tools from all agents
             # This would require each agent to expose its tools
@@ -1080,6 +1119,7 @@ class MultiAgentSystem:
             log(f"Lỗi khi tạo biểu đồ LangGraph: {str(e)}")
             # Không làm gián đoạn quá trình khởi tạo nếu có lỗi khi tạo biểu đồ
     
+    @opik_track(name="run_reflection_agent")
     async def run_reflection_agent(self, state: AgentState) -> AgentState:
         """
         Run the reflection agent to create final response for user.
@@ -1108,7 +1148,7 @@ class MultiAgentSystem:
             # Add to chain of thought
             if "chain_of_thought" not in state:
                 state["chain_of_thought"] = []
-            state["chain_of_thought"].append(f"🤔 Reflection: Tạo câu trả lời cuối cùng cho người dùng")
+            state["chain_of_thought"].append(f"🤔 Reflection: Generating final response")
             
             # Mark task as complete
             state["task_complete"] = True
@@ -1120,7 +1160,7 @@ class MultiAgentSystem:
         except Exception as e:
             log(f"Error in reflection agent: {str(e)}", level='error')
             # Fallback response
-            fallback_response = "Tôi đã hoàn thành yêu cầu của bạn thành công."
+            fallback_response = "I have successfully completed your request."
             state["messages"].append(AIMessage(content=f"💭 {fallback_response}"))
             state["task_complete"] = True
             state["success_criteria_met"] = True
@@ -1275,7 +1315,7 @@ class MultiAgentSystem:
             else:
                 log("⚠️ [HUMAN_FEEDBACK] Không có human_feedback_agent để xử lý phản hồi!", level='warning')
                 # Thêm thông báo lỗi
-                error_msg = "❌ Không thể xử lý phản hồi do thiếu human_feedback_agent"
+                error_msg = "❌ Unable to process feedback: human_feedback_agent is missing"
                 state["messages"].append(AIMessage(content=error_msg))
                 return state
                 
@@ -1284,7 +1324,7 @@ class MultiAgentSystem:
             import traceback
             traceback.print_exc()
             # Thêm thông báo lỗi
-            error_msg = f"❌ Đã xảy ra lỗi khi xử lý phản hồi: {str(e)}"
+            error_msg = f"❌ An error occurred while processing feedback: {str(e)}"
             state["messages"].append(AIMessage(content=error_msg))
             return state
     
@@ -1351,30 +1391,30 @@ class MultiAgentSystem:
         
         # Create or update system message with task information
         system_message = f"""
-        Bạn là một trợ lý AI thông minh có thể sử dụng nhiều công cụ và tác tử chuyên biệt để hoàn thành nhiệm vụ.
-        Bạn có thể tiếp tục làm việc với một nhiệm vụ cho đến khi hoàn thành hoặc cần thêm thông tin từ người dùng.
+        You are an intelligent AI assistant that can use multiple specialized tools and agents to complete tasks.
+        You can continue working on a task until it is completed or you need more information from the user.
         
-        Bạn có quyền truy cập vào các tác tử chuyên biệt sau:
-        1. Filesystem Agent: Sử dụng khi cần tìm kiếm, liệt kê hoặc quản lý tệp và thư mục theo tên file.
-        2. RAG Agent: Sử dụng khi cần tìm kiếm tài liệu theo nội dung hoặc ngữ nghĩa.
-        3. Metadata Agent: Sử dụng khi cần tạo hoặc quản lý metadata cho tài liệu.
-        4. Text Extraction Agent: Sử dụng khi cần trích xuất văn bản từ các tệp PDF, Word hoặc PowerPoint.
-        5. File Classification Agent: Sử dụng khi cần phân loại nội dung tài liệu.
+        You have access to the following specialized agents:
+        1. Filesystem Agent: Use when you need to search, list, or manage files and directories by filename.
+        2. RAG Agent: Use when you need to search documents by content or semantics.
+        3. Metadata Agent: Use when you need to create or manage document metadata.
+        4. Text Extraction Agent: Use when you need to extract text from PDF, Word, or PowerPoint files.
+        5. File Classification Agent: Use when you need to classify document content.
         
-        Bạn có thể sử dụng nhiều tác tử trong cùng một nhiệm vụ nếu cần thiết.
-        Ví dụ: Tìm tệp với Filesystem Agent, sau đó trích xuất nội dung với Text Extraction Agent.
+        You can use multiple agents in the same task if needed.
+        Example: Find files with Filesystem Agent, then extract content with Text Extraction Agent.
         
-        Hãy phân tích yêu cầu của người dùng và quyết định sử dụng tác tử nào hoặc kết hợp các tác tử để hoàn thành nhiệm vụ.
+        Always respond in English. Analyze the user's request and decide which agent(s) to use to complete the task.
         """
         
         # Add feedback if available
         if state.get("feedback_on_work"):
             system_message += f"""
         
-Trước đó, bạn đã thử giải quyết nhiệm vụ nhưng chưa hoàn thành. Đây là phản hồi:
+Previously, you attempted to solve the task but it was not completed. Here is the feedback:
 {state['feedback_on_work']}
 
-Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi này.
+Please adjust your approach based on this feedback.
         """
         
         # Add system message if not already present
@@ -1409,19 +1449,19 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
         try:
             # Tạo prompt cho LLM
             planning_prompt = f"""
-            Bạn là một hệ thống điều phối các agent AI chuyên biệt. Dựa trên yêu cầu của người dùng, hãy lập kế hoạch sử dụng các agent phù hợp.
+            You are a system that coordinates specialized AI agents. Based on the user's request, plan which agents to use.
             
-            Yêu cầu của người dùng: "{query}"
+            User request: "{query}"
             
-            Các agent có sẵn:
-            1. filesystem - Tìm kiếm, liệt kê và quản lý tệp và thư mục
-            2. metadata - Tạo và quản lý metadata cho tài liệu
-            3. text_extraction - Trích xuất văn bản từ tệp PDF, Word hoặc PowerPoint
-            4. file_classification - Phân loại nội dung tài liệu
+            Available agents:
+            1. filesystem - Search, list, and manage files and directories
+            2. metadata - Create and manage document metadata
+            3. text_extraction - Extract text from PDF, Word, or PowerPoint files
+            4. file_classification - Classify document content
             
-            Hãy lập kế hoạch sử dụng các agent. Đầu tiên, trả lời với danh sách các agent cần sử dụng theo thứ tự, chỉ liệt kê tên các agent (filesystem, metadata, text_extraction, file_classification), cách nhau bằng dấu phẩy.
+            Plan the agent usage. First, respond with the list of agents to use in order, listing only agent names (filesystem, metadata, text_extraction, file_classification), separated by commas.
             
-            Sau đó, viết một đoạn văn ngắn giải thích kế hoạch của bạn bằng tiếng Việt.
+            Then, write a brief paragraph explaining your plan in English.
             """
             
             # Sử dụng LLM để lập kế hoạch
@@ -1429,12 +1469,12 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
             response = await gemini.ainvoke(planning_prompt)
             plan_response = response.content.strip()
             
-            # Tách phần danh sách agent và phần giải thích
+            # Parse agent list and explanation
             parts = plan_response.split('\n', 1)
             agent_list = parts[0].strip().lower()
-            plan_message = parts[1].strip() if len(parts) > 1 else f"Tôi sẽ giúp bạn với yêu cầu: '{query}'."
+            plan_message = parts[1].strip() if len(parts) > 1 else f"I'll help you with your request: '{query}'."
             
-            # Xử lý danh sách agent
+            # Process agent list
             needed_agents = []
             valid_agents = ["filesystem", "metadata", "text_extraction", "file_classification"]
             
@@ -1445,15 +1485,15 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
             if not needed_agents:
                 # Mặc định sử dụng filesystem nếu không có agent nào được chọn
                 needed_agents.append("filesystem")
-                plan_message += "\nTôi sẽ bắt đầu với Filesystem Agent để tìm kiếm thông tin."
+                plan_message += "\nI'll start with the Filesystem Agent to search for information."
             
-            print(f"Kế hoạch agent: {needed_agents}")
+            print(f"Agent plan: {needed_agents}")
             
         except Exception as e:
-            print(f"Lỗi khi lập kế hoạch sử dụng agent: {e}")
-            # Sử dụng mặc định nếu có lỗi
+            print(f"Error in agent planning: {e}")
+            # Use default if error
             needed_agents = ["filesystem"]
-            plan_message = f"Tôi sẽ giúp bạn với yêu cầu: '{query}'. Tôi sẽ bắt đầu với Filesystem Agent để tìm kiếm thông tin."
+            plan_message = f"I'll help you with your request: '{query}'. Starting with the Filesystem Agent to search for information."
         
         # Update state with the plan
         state["current_agents"] = needed_agents
@@ -1582,6 +1622,7 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
         
         return state
         
+    @opik_track(name="evaluator")
     async def evaluator(self, state: AgentState) -> AgentState:
         """
         Evaluator node that assesses if the task has been completed successfully.
@@ -1621,20 +1662,20 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
         
         # Create evaluator prompt
         evaluator_prompt = f"""
-        Bạn là một đánh giá viên xác định xem một nhiệm vụ đã được hoàn thành thành công hay chưa.
-        Đánh giá phản hồi cuối cùng của Trợ lý dựa trên yêu cầu ban đầu của người dùng.
+        You are an evaluator determining whether a task has been completed successfully.
+        Evaluate the assistant's final response based on the user's original request.
         
-        Yêu cầu ban đầu của người dùng là:
+        Original user request:
         {original_query}
         
-        Lịch sử hội thoại:
+        Conversation history:
         {conversation}
         
-        Phản hồi cuối cùng của Trợ lý:
+        Assistant's final response:
         {last_response}
         
-        Hãy đánh giá xem nhiệm vụ đã hoàn thành chưa và liệu có cần thêm thông tin từ người dùng không.
-        Nếu nhiệm vụ chưa hoàn thành, hãy giải thích tại sao và đề xuất cách tiếp cận khác.
+        Evaluate whether the task is complete and whether more information is needed from the user.
+        If the task is not complete, explain why and suggest an alternative approach.
         """
         
         # For now, we'll use a simple heuristic to determine if the task is complete
@@ -1644,7 +1685,7 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
         task_complete = len(state.get("used_tools", [])) > 0
         
         # Check if the last response contains certain keywords indicating completion
-        completion_indicators = ["đã hoàn thành", "đã tìm thấy", "kết quả", "đã xử lý", "đã trích xuất", "đã phân loại"]
+        completion_indicators = ["completed", "found", "result", "processed", "extracted", "classified", "I found", "successfully", "đã hoàn thành", "đã tìm thấy", "kết quả"]
         for indicator in completion_indicators:
             if indicator in last_response.lower():
                 task_complete = True
@@ -1660,17 +1701,17 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
         # Set the evaluation results
         feedback = ""
         if task_complete:
-            feedback = "Nhiệm vụ đã được hoàn thành thành công. Phản hồi đã giải quyết yêu cầu của người dùng."
+            feedback = "Task completed successfully. The response addressed the user's request."
             state["success_criteria_met"] = True
         else:
-            feedback = "Nhiệm vụ chưa hoàn thành. Cần sử dụng thêm tác tử hoặc công cụ để giải quyết yêu cầu của người dùng."
+            feedback = "Task not yet completed. Additional agents or tools are needed to address the user's request."
             state["success_criteria_met"] = False
         
         # Add the feedback to the state
         state["feedback_on_work"] = feedback
         
         # Add evaluator message to the conversation
-        state["messages"].append(AIMessage(content=f"[Đánh giá nội bộ: {feedback}]"))
+        state["messages"].append(AIMessage(content=f"[Internal evaluation: {feedback}]"))
         
         return state
     
@@ -1733,6 +1774,7 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
         log(f"Mặc định tìm kiếm theo tên file cho câu ngắn: {query}")
         return "filesystem"
 
+    @opik_track(name="run_filesystem_agent")
     async def run_filesystem_agent(self, state: AgentState) -> AgentState:
         """
         Run the filesystem agent on the current query.
@@ -1752,6 +1794,12 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
                 state["used_tools"] = []
             state["used_tools"].append("filesystem")
 
+            # Check if filesystem agent is available
+            if "filesystem" not in self.agents:
+                log("FilesystemAgent not available, falling back to RAG agent", level='warning')
+                state["messages"].append(AIMessage(content="⚠️ FilesystemAgent not initialized. Switching to RAG Agent..."))
+                return await self.run_rag_agent(state)
+
             # Get the filesystem agent graph
             filesystem_agent = self.agents["filesystem"]
 
@@ -1770,7 +1818,7 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
 
             if not agent_response or not agent_response.content.strip():
                 # If there's no response or it's empty, create a default one
-                agent_response = AIMessage(content="Tôi đã tìm kiếm nhưng không tìm thấy kết quả phù hợp.")
+                agent_response = AIMessage(content="I searched but could not find any matching results.")
 
             # Add the agent's response to the state
             response_content = f"🗂️ {agent_response.content}"
@@ -1784,7 +1832,7 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
             state["agent_results"]["filesystem"] = agent_response.content
             
             # Check if filesystem agent found any results
-            if "Không tìm thấy" in agent_response.content or "không biết" in agent_response.content.lower() or "không tìm thấy" in agent_response.content.lower():
+            if "Không tìm thấy" in agent_response.content or "không biết" in agent_response.content.lower() or "không tìm thấy" in agent_response.content.lower() or "not find" in agent_response.content.lower() or "no matching" in agent_response.content.lower() or "could not find" in agent_response.content.lower():
                 print("Filesystem agent didn't find results. Trying RAG agent...")
                 
                 # Call RAG agent for content-based search
@@ -1793,7 +1841,7 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
                 
                 if isinstance(rag_result, dict) and 'content' in rag_result:
                     # Add RAG response to messages
-                    rag_content = f"🔍 Tìm kiếm theo nội dung file:\n\n{rag_result['content']}"
+                    rag_content = f"🔍 Content-based search results:\n\n{rag_result['content']}"
                     state["messages"].append(AIMessage(content=rag_content))
                     
                     # Store RAG result
@@ -1819,10 +1867,11 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
         except Exception as e:
             print(f"Error running filesystem agent: {e}")
             # Add an error message to the state
-            error_message = f"Xin lỗi, tôi gặp lỗi khi tìm kiếm tệp: {str(e)}"
+            error_message = f"Sorry, I encountered an error while searching for files: {str(e)}"
             state["messages"].append(AIMessage(content=error_message))
             return state
         
+    @opik_track(name="run_data_analysis_agent")
     async def run_data_analysis_agent(self, state: AgentState) -> AgentState:
         try:
             log("Running DataAnalysisAgent...")
@@ -1843,7 +1892,7 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
                     log(f"Found extracted contents from text_extraction_results: {len(extracted_contents)} files")
             
             if not extracted_contents:
-                error_msg = "❌ Không tìm thấy nội dung đã trích xuất để phân tích"
+                error_msg = "❌ No extracted content found for analysis"
                 state["messages"].append(AIMessage(content=error_msg))
                 return state
             
@@ -1875,9 +1924,9 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
             # Format the response
             if analysis_results and "report" in analysis_results:
                 report = analysis_results["report"]
-                response_content = f"📊 Kết quả phân tích so sánh dữ liệu:\n\n{report}"
+                response_content = f"📊 Data comparison analysis results:\n\n{report}"
             else:
-                response_content = f"📊 Đã hoàn thành phân tích {len(extracted_contents)} files"
+                response_content = f"📊 Completed analysis of {len(extracted_contents)} files"
             
             # Add response to messages
             state["messages"].append(AIMessage(content=response_content))
@@ -1890,14 +1939,14 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
             # Add to chain of thought
             if "chain_of_thought" not in state:
                 state["chain_of_thought"] = []
-            state["chain_of_thought"].append(f"📊 Đã phân tích và so sánh dữ liệu từ {len(extracted_contents)} files")
+            state["chain_of_thought"].append(f"📊 Analyzed and compared data from {len(extracted_contents)} files")
             
             log(f"DataAnalysisAgent completed: analyzed {len(extracted_contents)} files")
             return state
         
         except Exception as e:
             log(f"Error in data analysis agent: {str(e)}", level='error')
-            error_message = f"❌ Lỗi khi phân tích dữ liệu: {str(e)}"
+            error_message = f"❌ Error analyzing data: {str(e)}"
             state["messages"].append(AIMessage(content=error_message))
             return state
 
@@ -1919,34 +1968,31 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
                 original_query = message.content
                 break
         
-        # Danh sách các agent đã sử dụng
         used_agents = state.get("used_tools", [])
         
-        # Nếu đã sử dụng quá nhiều agent, không đề xuất thêm
         if len(used_agents) >= 3:
-            print("Đã sử dụng quá nhiều agent, không đề xuất thêm")
+            print("Too many agents used, not suggesting more")
             return None
         
-        # Tạo prompt cho LLM
         prompt = f"""
-        Bạn là một hệ thống điều phối các agent AI chuyên biệt. Dựa trên thông tin sau, hãy quyết định agent nào nên được sử dụng tiếp theo.
+        You are a system that coordinates specialized AI agents. Based on the following information, decide which agent should be used next.
         
-        Yêu cầu ban đầu của người dùng: "{original_query}"
+        Original user request: "{original_query}"
         
-        Phản hồi mới nhất từ agent: "{response_content}"
+        Latest agent response: "{response_content}"
         
-        Các agent đã được sử dụng: {used_agents}
+        Agents already used: {used_agents}
         
-        Các agent có sẵn:
-        1. filesystem - Tìm kiếm, liệt kê và quản lý tệp và thư mục
-        2. metadata - Tạo và quản lý metadata cho tài liệu
-        3. text_extraction - Trích xuất văn bản từ tệp PDF, Word hoặc PowerPoint
-        4. file_classification - Phân loại nội dung tài liệu
+        Available agents:
+        1. filesystem - Search, list, and manage files and directories
+        2. metadata - Create and manage document metadata
+        3. text_extraction - Extract text from PDF, Word, or PowerPoint files
+        4. file_classification - Classify document content
         
-        QUAN TRỌNG: Chỉ đề xuất một agent tiếp theo nếu thực sự cần thiết dựa trên yêu cầu ban đầu và phản hồi hiện tại.
-        Nếu agent hiện tại đã giải quyết được vấn đề hoặc không cần agent khác, hãy trả lời "none".
+        IMPORTANT: Only suggest a next agent if truly necessary based on the original request and current response.
+        If the current agent has resolved the issue or no other agent is needed, respond with "none".
         
-        Trả lời chỉ với tên của agent (filesystem, metadata, text_extraction, file_classification) hoặc "none" nếu không cần agent nào nữa.
+        Respond only with the agent name (filesystem, metadata, text_extraction, file_classification) or "none".
         """
         
         try:
@@ -1955,27 +2001,24 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
             response = await gemini.ainvoke(prompt)
             suggestion = response.content.strip().lower()
             
-            # Kiểm tra xem có từ "none" trong phản hồi không
             if "none" in suggestion:
-                print("LLM đề xuất không cần sử dụng thêm agent")
+                print("LLM suggests no additional agent needed")
                 return None
             
-            # Xử lý phản hồi
             valid_agents = ["filesystem", "metadata", "text_extraction", "file_classification"]
             
-            # Chỉ đề xuất agent chưa được sử dụng
             for agent in valid_agents:
                 if agent in suggestion and agent not in used_agents:
-                    print(f"LLM đề xuất sử dụng {agent} tiếp theo")
+                    print(f"LLM suggests using {agent} next")
                     return agent
             
-            # Không có đề xuất hợp lệ
             return None
             
         except Exception as e:
-            print(f"Lỗi khi đề xuất agent tiếp theo: {e}")
+            print(f"Error suggesting next agent: {e}")
             return None
     
+    @opik_track(name="run_rag_agent")
     async def run_rag_agent(self, state: AgentState) -> AgentState:
         """
         Run the RAG agent to search file contents.
@@ -2014,7 +2057,7 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
                 
                 # Nếu RAG trả về chuỗi văn bản có chứa đường dẫn file, trích xuất chúng
                 # Mẫu: "Tôi đã tìm thấy các file sau:\n1. C:\path\to\file1.docx\n2. C:\path\to\file2.docx"
-                if "\n" in response_content and ("Tôi đã tìm thấy" in response_content or "tìm thấy các file" in response_content):
+                if "\n" in response_content and ("Tôi đã tìm thấy" in response_content or "tìm thấy các file" in response_content or "I found the" in response_content or "found the following files" in response_content):
                     lines = response_content.split("\n")
                     for line in lines:
                         # Tìm các dòng có đường dẫn file
@@ -2052,10 +2095,11 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
         except Exception as e:
             log(f"Error in RAG agent: {str(e)}", level='error')
             state["messages"].append(AIMessage(
-                content=f"Có lỗi xảy ra khi tìm kiếm nội dung: {str(e)}"
+                content=f"An error occurred while searching for content: {str(e)}"
             ))
             return state
 
+    @opik_track(name="run_metadata_agent")
     async def run_metadata_agent(self, state: AgentState) -> AgentState:
         """
         Run the metadata agent on the current query.
@@ -2100,10 +2144,9 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
                                 break
                         
                         # Check for file paths in message content
-                        if "Tôi đã tìm thấy file:" in message.content:
+                        if "Tôi đã tìm thấy file:" in message.content or "I found the file:" in message.content:
                             import re
-                            # Tìm một file path
-                            file_pattern = r'Tôi đã tìm thấy file:\s*([A-Z]:\\[^\s\n\r]+)'
+                            file_pattern = r'(?:Tôi đã tìm thấy file:|I found the file:)\s*([A-Z]:\\[^\s\n\r]+)'
                             file_matches = re.findall(file_pattern, message.content)
                             if file_matches:
                                 file_paths = file_matches
@@ -2126,7 +2169,9 @@ Hãy điều chỉnh cách tiếp cận của bạn dựa trên phản hồi nà
                 # Check if this is a text extraction agent message
                 is_extraction_msg = ("📄" in message.content or "[Text Extraction Agent]:" in message.content or 
                                    "Nội dung trích xuất:" in message.content or
-                                   "Kết quả trích xuất từ file" in message.content)
+                                   "Kết quả trích xuất từ file" in message.content or
+                                   "Extraction result from file" in message.content or
+                                   "Extracted content:" in message.content)
                 
                 if is_extraction_msg:
                     log(f"Found text extraction agent message")
@@ -2512,7 +2557,7 @@ LƯU Ý CUỐI CÙNG:
                 
                 # Process the response
                 if not response or not response.strip():
-                    response_content = "Tôi đã xử lý metadata nhưng không có kết quả đáng chú ý."
+                    response_content = "I processed the metadata but found no notable results."
                     log("No response content from MetadataAgent")
                 else:
                     # Clean up the response
@@ -2544,14 +2589,14 @@ LƯU Ý CUỐI CÙNG:
                             
                             # Tạo danh sách tên file ngắn gọn
                             if len(file_names) > 3:
-                                file_list = f"{', '.join(file_names[:2])} và {len(file_names)-2} file khác"
+                                file_list = f"{', '.join(file_names[:2])} and {len(file_names)-2} more files"
                             else:
                                 file_list = ", ".join(file_names)
                                 
-                            response_content = f"✅ Đã lưu metadata cho {file_count} files ({file_list}). ID: {metadata_id}"
+                            response_content = f"✅ Metadata saved for {file_count} files ({file_list}). ID: {metadata_id}"
                         else:
-                            file_name = metadata_params.get('file_name', 'không xác định')
-                            response_content = f"✅ Đã lưu metadata cho file {file_name} thành công. ID: {metadata_id}"
+                            file_name = metadata_params.get('file_name', 'unknown')
+                            response_content = f"✅ Metadata saved successfully for file {file_name}. ID: {metadata_id}"
                             
                         log(f"Metadata saved with ID: {metadata_id}")
                         
@@ -2580,20 +2625,20 @@ LƯU Ý CUỐI CÙNG:
                             
                             # Tạo danh sách tên file ngắn gọn
                             if len(file_names) > 3:
-                                file_list = f"{', '.join(file_names[:2])} và {len(file_names)-2} file khác"
+                                file_list = f"{', '.join(file_names[:2])} and {len(file_names)-2} more files"
                             else:
                                 file_list = ", ".join(file_names)
                                 
                             if any(keyword in response.lower() for keyword in error_keywords):
-                                response_content = f"❌ Lỗi khi xử lý metadata cho {file_count} files ({file_list}): {response}"
+                                response_content = f"❌ Error processing metadata for {file_count} files ({file_list}): {response}"
                             else:
-                                response_content = f"ℹ️ Đã xử lý metadata cho {file_count} files ({file_list}), nhưng không tìm thấy ID: {response}"
+                                response_content = f"ℹ️ Processed metadata for {file_count} files ({file_list}), but no ID found: {response}"
                         else:
-                            file_name = metadata_params.get('file_name', 'không xác định')
+                            file_name = metadata_params.get('file_name', 'unknown')
                             if any(keyword in response.lower() for keyword in error_keywords):
-                                response_content = f"❌ Lỗi khi xử lý metadata cho file {file_name}: {response}"
+                                response_content = f"❌ Error processing metadata for file {file_name}: {response}"
                             else:
-                                response_content = f"ℹ️ Đã xử lý metadata cho file {file_name}, nhưng không tìm thấy ID: {response}"
+                                response_content = f"ℹ️ Processed metadata for file {file_name}, but no ID found: {response}"
                         
                         log(f"Metadata agent response (no ID found): {response}")
                         
@@ -2673,10 +2718,10 @@ LƯU Ý CUỐI CÙNG:
                 return state
                 
             except Exception as e:
-                error_msg = f"Lỗi khi chạy MetadataAgent: {str(e)}"
+                error_msg = f"Error running MetadataAgent: {str(e)}"
                 log(error_msg, level='error')
                 state["messages"].append(AIMessage(
-                    content=f"[Lỗi] {error_msg}. Vui lòng thử lại hoặc kiểm tra kết nối MCP server."
+                    content=f"[Error] {error_msg}. Please try again or check the MCP server connection."
                 ))
                 return state
 
@@ -2685,10 +2730,11 @@ LƯU Ý CUỐI CÙNG:
             print(f"Error running metadata agent: {e}")
             print(traceback.format_exc())
             # Add an error message to the state
-            error_message = f"Xin lỗi, tôi gặp lỗi khi xử lý metadata: {str(e)}"
+            error_message = f"Sorry, I encountered an error while processing metadata: {str(e)}"
             state["messages"].append(AIMessage(content=error_message))
             return state
 
+    @opik_track(name="run_text_extraction_agent")
     async def run_text_extraction_agent(self, state: AgentState) -> AgentState:
         """
         Run the text extraction agent on the current query.
@@ -2723,14 +2769,12 @@ LƯU Ý CUỐI CÙNG:
                                 break
                     
                     # Tìm kiếm câu "Tôi đã tìm thấy file:" hoặc "Tôi đã tìm thấy {n} files:" trong tin nhắn
-                    if "Tôi đã tìm thấy file:" in message.content:
+                    if "Tôi đã tìm thấy file:" in message.content or "I found the file:" in message.content:
                         log(f"Found agent message with standard format for single file")
                         
-                        # Tìm đường dẫn file sau câu "Tôi đã tìm thấy file:"
                         import re
                         
-                        # Tìm sau "Tôi đã tìm thấy file:" - kiểm tra cả đường dẫn đầy đủ
-                        full_path_pattern = r'Tôi đã tìm thấy file:\s*([A-Z]:\\[^\s\n\r]+)'
+                        full_path_pattern = r'(?:Tôi đã tìm thấy file:|I found the file:)\s*([A-Z]:\\[^\s\n\r]+)'
                         full_path_matches = re.findall(full_path_pattern, message.content)
                         
                         if full_path_matches:
@@ -2744,12 +2788,12 @@ LƯU Ý CUỐI CÙNG:
                             log(f"Extracted full file path: {file_paths[-1]}")
                             break
                     
-                    # Tìm nhiều file từ định dạng "Tôi đã tìm thấy {n} files:"
-                    elif "files:" in message.content and "Tôi đã tìm thấy" in message.content:
+                    # Find multiple files from format "I found {n} files:" or "Tôi đã tìm thấy {n} files:"
+                    elif "files:" in message.content and ("Tôi đã tìm thấy" in message.content or "I found" in message.content):
                         log(f"Found agent message with multiple files format")
                         import re
                         
-                        # Tìm đường dẫn file từ danh sách đánh số
+                        # Find file paths from numbered list
                         multi_file_pattern = r'\d+\.\s*([A-Z]:\\[^\s\n\r]+)'
                         multi_file_matches = re.findall(multi_file_pattern, message.content)
                         
@@ -2763,7 +2807,7 @@ LƯU Ý CUỐI CÙNG:
                             break
                     
                     # Dự phòng: Nếu không tìm thấy câu chuẩn, thử tìm bất kỳ đường dẫn Windows nào
-                    elif any(indicator in message.content for indicator in ["Đã tìm thấy file:", "tìm thấy file", "[Filesystem Agent]:", "[RAG Agent]:", "🗂️", "🔍"]):
+                    elif any(indicator in message.content for indicator in ["Đã tìm thấy file:", "tìm thấy file", "Found file:", "found file", "[Filesystem Agent]:", "[RAG Agent]:", "🗂️", "🔍"]):
                         log(f"Found agent message with non-standard format")
                         
                         # Tìm bất kỳ đường dẫn nào trong tin nhắn
@@ -2814,7 +2858,7 @@ LƯU Ý CUỐI CÙNG:
                 
                 if not accessible_files:
                     # Không có quyền truy cập vào bất kỳ file nào, thông báo cho người dùng
-                    error_message = f"⚠️ Không thể trích xuất nội dung: Bạn không có quyền truy cập vào các file này"
+                    error_message = f"⚠️ Unable to extract content: You do not have access to these files"
                     state["messages"].append(AIMessage(content=error_message))
                     log(f"Access denied to all files", level='warning')
                     
@@ -2901,8 +2945,15 @@ LƯU Ý CUỐI CÙNG:
                     content = extracted_text[1].strip()
                     log(f"Extracted the actual content after introduction: {content[:100]}...")
             
-            # Kiểm tra nếu content chứa "I'll use the extract_text_from" (câu trả lời của agent) hoặc nếu nội dung trích xuất trùng với query
-            if ("I'll use the extract_text_from" in content or content.strip() == query.strip()) and "accessible_files" in state:
+            # Kiểm tra nếu agent không trích xuất được nội dung thực tế
+            # Các trường hợp: agent trả về mô tả tool, trả về query gốc, hoặc trả về enhanced_query
+            _content_is_not_real_extraction = (
+                "I'll use the extract_text_from" in content
+                or content.strip() == query.strip()
+                or content.strip() == enhanced_query.strip()
+                or content.strip().startswith("Extract text from")
+            )
+            if _content_is_not_real_extraction and "accessible_files" in state:
                 log("Agent response contains tool usage description but no actual extraction result or returned the query")
                 # Thử trực tiếp các hàm trích xuất dựa vào định dạng file
                 from agents.text_extraction_agent import extract_text_from_pdf, extract_text_from_word, extract_text_from_powerpoint
@@ -2926,13 +2977,13 @@ LƯU Ý CUỐI CÙNG:
                             log(f"Directly extracted text from PowerPoint: {file_path}")
                     except Exception as e:
                         log(f"Error in direct extraction for {file_path}: {e}", level='error')
-                        extraction_results[file_path] = f"Lỗi khi trích xuất: {str(e)}"
+                        extraction_results[file_path] = f"Error extracting: {str(e)}"
                 
                 # Nếu có kết quả trích xuất, gộp lại
                 if extraction_results:
                     content = ""
                     for file_path, extracted_text in extraction_results.items():
-                        content += f"\n\n--- Từ file {os.path.basename(file_path)} ---\n{clean_invalid_unicode(extracted_text)}\n"
+                        content += f"\n\n--- From file {os.path.basename(file_path)} ---\n{clean_invalid_unicode(extracted_text)}\n"
                     content = content.strip()
                     
                     # Store individual file extraction results in the state
@@ -2942,19 +2993,19 @@ LƯU Ý CUỐI CÙNG:
             if not content.strip():
                 if "accessible_files" in state and state["accessible_files"]:
                     if len(state["accessible_files"]) == 1:
-                        content = f"Tôi đã cố gắng trích xuất nội dung từ file {state['accessible_files'][0]} nhưng không có kết quả đáng chú ý."
+                        content = f"I attempted to extract content from file {state['accessible_files'][0]} but found no notable results."
                     else:
-                        content = f"Tôi đã cố gắng trích xuất nội dung từ {len(state['accessible_files'])} files nhưng không có kết quả đáng chú ý."
+                        content = f"I attempted to extract content from {len(state['accessible_files'])} files but found no notable results."
                 else:
-                    content = "Tôi đã cố gắng trích xuất nội dung nhưng không có kết quả đáng chú ý."
+                    content = "I attempted to extract content but found no notable results."
 
             # Add the agent's response to the state with clear indication of extraction results
             if "accessible_files" in state and state["accessible_files"]:
                 if len(state["accessible_files"]) == 1:
-                    response_content = f"📝 Kết quả trích xuất từ file {state['accessible_files'][0]}:\n\n{content}"
+                    response_content = f"📝 Extraction result from file {state['accessible_files'][0]}:\n\n{content}"
                 else:
                     file_list = "\n".join([f"- {os.path.basename(f)}" for f in state["accessible_files"]])
-                    response_content = f"📝 Kết quả trích xuất từ {len(state['accessible_files'])} files:\n{file_list}\n\n{content}"
+                    response_content = f"📝 Extraction result from {len(state['accessible_files'])} files:\n{file_list}\n\n{content}"
             else:
                 response_content = f"📝 {content}"
                 
@@ -3029,10 +3080,11 @@ LƯU Ý CUỐI CÙNG:
         except Exception as e:
             log(f"Error running text extraction agent: {e}", level='error')
             # Add an error message to the state
-            error_message = f"Xin lỗi, tôi gặp lỗi khi trích xuất nội dung: {str(e)}"
+            error_message = f"Sorry, I encountered an error while extracting content: {str(e)}"
             state["messages"].append(AIMessage(content=error_message))
             return state
             
+    @opik_track(name="run_file_classification_agent")
     async def run_file_classification_agent(self, state: AgentState):
         """
         Run the file classification agent on the current query.
@@ -3374,7 +3426,7 @@ LƯU Ý CUỐI CÙNG:
 
             # Kiểm tra kết quả phân loại và xử lý trùng lặp
             if not classification_result.strip():
-                classification_result = "Không thể phân loại"
+                classification_result = "Unable to classify"
             else:
                 # Xử lý kết quả phân loại
                 lines = classification_result.strip().split('\n')
@@ -3455,20 +3507,20 @@ LƯU Ý CUỐI CÙNG:
                 if len(final_classifications) == 1:
                     file_name = list(final_classifications.keys())[0]
                     classification = final_classifications[file_name]
-                    response_content = f"🏷️ Kết quả phân loại file {file_name}: {classification}"
+                    response_content = f"🏷️ File classification result for {file_name}: {classification}"
                 else:
                     # Multiple files
                     classifications = []
                     for file_name, classification in final_classifications.items():
                         # Mark stored classifications
                         is_stored = any(file_name == os.path.basename(k) for k in stored_classifications)
-                        source = " (từ phản hồi người dùng)" if is_stored else ""
+                        source = " (from user feedback)" if is_stored else ""
                         classifications.append(f"{file_name}: {classification}{source}")
                     
                     formatted_classifications = "\n- ".join(classifications)
-                    response_content = f"🏷️ Kết quả phân loại {len(final_classifications)} files:\n- {formatted_classifications}"
+                    response_content = f"🏷️ Classification result for {len(final_classifications)} files:\n- {formatted_classifications}"
             else:
-                response_content = f"🏷️ Không có kết quả phân loại"
+                response_content = f"🏷️ No classification results"
             
             log(f"Final classification response: {response_content}")
             
@@ -3516,10 +3568,11 @@ LƯU Ý CUỐI CÙNG:
         except Exception as e:
             log(f"Error running file classification agent: {e}", level='error')
             # Add an error message to the state
-            error_message = f"Xin lỗi, tôi gặp lỗi khi phân loại tệp: {str(e)}"
+            error_message = f"Sorry, I encountered an error while classifying the file: {str(e)}"
             state["messages"].append(AIMessage(content=error_message))
             return state
 
+    @opik_track(name="plan_agents")
     async def plan_agents(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Enhanced agent planning that includes data analysis for comparison queries."""
         last_message = state["messages"][-1]
@@ -3528,31 +3581,31 @@ LƯU Ý CUỐI CÙNG:
         try:
             # Enhanced planning prompt that includes data analysis
             planning_prompt = f"""
-            Bạn là một hệ thống điều phối các agent AI chuyên biệt. Dựa trên yêu cầu của người dùng, hãy lập kế hoạch sử dụng các agent phù hợp.
+            You are a system that coordinates specialized AI agents. Based on the user's request, plan which agents to use.
             
-            Yêu cầu của người dùng: "{query}"
+            User request: "{query}"
         
-            Các agent có sẵn:
-            1. filesystem - Tìm kiếm, liệt kê và quản lý tệp và thư mục theo tên file
-            2. rag - Tìm kiếm tài liệu theo nội dung hoặc ngữ nghĩa
-            3. metadata - Tạo và quản lý metadata cho tài liệu
-            4. text_extraction - Trích xuất văn bản từ tệp PDF, Word hoặc PowerPoint
-            5. file_classification - Phân loại nội dung tài liệu
-            6. data_analysis - Phân tích và so sánh dữ liệu từ nhiều nguồn (đặc biệt cho dữ liệu tài chính)
+            Available agents:
+            1. filesystem - Search, list, and manage files and directories by filename
+            2. rag - Search documents by content or semantics
+            3. metadata - Create and manage document metadata
+            4. text_extraction - Extract text from PDF, Word, or PowerPoint files
+            5. file_classification - Classify document content
+            6. data_analysis - Analyze and compare data from multiple sources (especially financial data)
             
-            QUAN TRỌNG - LUẬT SỬ DỤNG DATA_ANALYSIS:
-            - Nếu yêu cầu có chứa từ khóa "so sánh", "phân tích", "compare", "analysis", "xu hướng", "tăng trưởng" thì PHẢI sử dụng data_analysis
-            - Thứ tự bắt buộc cho phân tích dữ liệu: rag -> text_extraction -> data_analysis
-            - KHÔNG sử dụng file_classification hoặc metadata trong workflow phân tích dữ liệu trừ khi được yêu cầu cụ thể
+            IMPORTANT - DATA_ANALYSIS RULES:
+            - If the request contains keywords like "compare", "analyze", "analysis", "trend", "growth", "so sánh", "phân tích" then MUST use data_analysis
+            - Required order for data analysis: rag -> text_extraction -> data_analysis
+            - Do NOT use file_classification or metadata in data analysis workflow unless specifically requested
         
-            LƯU Ý QUAN TRỌNG:
-            - Nếu yêu cầu chỉ liên quan đến tìm kiếm file thì chỉ sử dụng rag hoặc filesystem
-            - Nếu yêu cầu liên quan đến so sánh dữ liệu tài chính, sử dụng: rag, text_extraction, data_analysis
-            - Nếu yêu cầu liên quan đến việc lưu metadata, thứ tự: rag/filesystem -> text_extraction -> file_classification -> metadata
+            IMPORTANT NOTES:
+            - If the request only involves file search, use only rag or filesystem
+            - If the request involves financial data comparison, use: rag, text_extraction, data_analysis
+            - If the request involves saving metadata, order: rag/filesystem -> text_extraction -> file_classification -> metadata
         
-            Hãy lập kế hoạch sử dụng các agent. Đầu tiên, trả lời với danh sách các agent cần sử dụng theo thứ tự, chỉ liệt kê tên các agent, cách nhau bằng dấu phẩy.
+            Plan the agent usage. First, respond with the list of agents to use in order, listing only agent names, separated by commas.
         
-            Sau đó, viết một đoạn văn ngắn giải thích kế hoạch của bạn bằng tiếng Việt.
+            Then, write a brief paragraph explaining your plan in English.
         """
         
         # Use LLM to plan
@@ -3563,7 +3616,7 @@ LƯU Ý CUỐI CÙNG:
             # Parse agent list and explanation
             parts = plan_response.split('\n', 1)
             agent_list = parts[0].strip().lower()
-            plan_message = parts[1].strip() if len(parts) > 1 else f"Tôi sẽ giúp bạn với yêu cầu: '{query}'."
+            plan_message = parts[1].strip() if len(parts) > 1 else f"I'll help you with your request: '{query}'."
             
             # Process agent list
             needed_agents = []
@@ -3574,7 +3627,7 @@ LƯU Ý CUỐI CÙNG:
                     needed_agents.append(agent)
             
             # Special handling for comparison queries
-            comparison_keywords = ["so sánh", "compare", "phân tích", "analysis", "xu hướng", "tăng trưởng"]
+            comparison_keywords = ["so sánh", "compare", "phân tích", "analysis", "xu hướng", "tăng trưởng", "trend", "growth"]
             if any(keyword in query.lower() for keyword in comparison_keywords):
                 # Force the correct order for data analysis
                 if "data_analysis" in needed_agents:
@@ -3593,23 +3646,23 @@ LƯU Ý CUỐI CÙNG:
                     ordered_agents.append("data_analysis")
                     needed_agents = ordered_agents
                     
-                    plan_message = f"Tôi sẽ thực hiện phân tích so sánh dữ liệu theo thứ tự: {', '.join(needed_agents)}."
+                    plan_message = f"I'll perform a comparative data analysis using: {', '.join(needed_agents)}."
             
             if not needed_agents:
                 needed_agents.append("rag")
-                plan_message += "\nTôi sẽ bắt đầu với RAG Agent để tìm kiếm thông tin."
+                plan_message += "\nI'll start with the RAG Agent to search for information."
             
             log(f"Enhanced agent plan: {needed_agents}")
             
         except Exception as e:
             log(f"Error in enhanced agent planning: {e}", level='error')
             # Default for comparison queries
-            if any(keyword in query.lower() for keyword in ["so sánh", "compare", "phân tích"]):
+            if any(keyword in query.lower() for keyword in ["so sánh", "compare", "phân tích", "analysis"]):
                 needed_agents = ["rag", "text_extraction", "data_analysis"]
-                plan_message = f"Tôi sẽ thực hiện phân tích so sánh dữ liệu: tìm kiếm file, trích xuất nội dung, và phân tích dữ liệu."
+                plan_message = f"I'll perform comparative data analysis: search files, extract content, and analyze data."
             else:
                 needed_agents = ["rag"]
-                plan_message = f"Tôi sẽ giúp bạn với yêu cầu: '{query}'. Bắt đầu với RAG Agent."
+                plan_message = f"I'll help you with your request: '{query}'. Starting with RAG Agent."
     
     # Update state with the plan
         state["current_agents"] = needed_agents
@@ -3617,6 +3670,7 @@ LƯU Ý CUỐI CÙNG:
         
         return state
         
+    @opik_track(name="multi_agent_run")
     async def run(self, query: str, session_id: str = None, user_role: str = "user") -> Dict[str, Any]:
         """
         Run the multi-agent system with the given query.
@@ -3630,6 +3684,9 @@ LƯU Ý CUỐI CÙNG:
             Dict chứa kết quả và trạng thái của hệ thống
         """
         try:
+            import time as _time_mod
+            _run_start_time = _time_mod.time()
+            
             # Set session ID
             self.session_id = session_id or str(uuid.uuid4())
             
@@ -3647,7 +3704,7 @@ LƯU Ý CUỐI CÙNG:
                 "success_criteria_met": False,
                 "completed": False,
                 "used_tools": [],
-                "chain_of_thought": ["🔍1. Bắt đầu xử lý yêu cầu: " + query],
+                "chain_of_thought": ["🔍1. Processing request: " + query],
                 "agent_results": {},
                 "original_query": query,
                 "user_role": user_role  # Thêm vai trò người dùng vào state
@@ -3683,7 +3740,7 @@ LƯU Ý CUỐI CÙNG:
             if is_feedback:
                 log("✅ [RUN] Phát hiện phản hồi, xử lý trực tiếp", level='info')
                 state["is_feedback"] = True
-                state["chain_of_thought"].append("🔄 Phát hiện phản hồi từ người dùng, chuyển sang xử lý phản hồi")
+                state["chain_of_thought"].append("🔄 User feedback detected, processing feedback")
                 try:
                     state = await self.process_human_feedback(state)
                 except Exception as e:
@@ -3691,10 +3748,10 @@ LƯU Ý CUỐI CÙNG:
                     import traceback
                     traceback.print_exc()
                     # Thêm thông báo lỗi vào state
-                    state["messages"].append(AIMessage(content=f"❌ Đã xảy ra lỗi khi xử lý phản hồi: {str(e)}"))
+                    state["messages"].append(AIMessage(content=f"❌ Error processing feedback: {str(e)}"))
                 
                 # Tạo phản hồi cuối cùng
-                final_content = "Cảm ơn bạn đã cung cấp phản hồi. Tôi đã ghi nhận và cập nhật thông tin phân loại."
+                final_content = "Thank you for your feedback. I've noted and updated the classification information."
                 state["messages"].append(AIMessage(content=final_content))
                 
                 return {
@@ -3713,7 +3770,7 @@ LƯU Ý CUỐI CÙNG:
             # Validate and fix agent sequence if needed
             state = await self._validate_agent_sequence(state)
             log(f"Kế hoạch agent sau khi kiểm tra: {state['current_agents']}")
-            state["chain_of_thought"].append(f"🧠2. Lập kế hoạch sử dụng các agent: {', '.join(state['current_agents'])}")
+            state["chain_of_thought"].append(f"🧠2. Planning agent usage: {', '.join(state['current_agents'])}")
             
             
             # Run the agents in the planned order
@@ -3724,7 +3781,7 @@ LƯU Ý CUỐI CÙNG:
                 agent_name = state["current_agents"].pop(0)
                 agent_execution_order.append(agent_name)
                 log(f"Running {agent_name} agent...")
-                state["chain_of_thought"].append(f"⚡{step_count}. Đang chạy agent: {agent_name}")
+                state["chain_of_thought"].append(f"⚡{step_count}. Running agent: {agent_name}")
                 
                 # Track agent execution order
                 if "agent_execution_order" not in state:
@@ -3743,7 +3800,7 @@ LƯU Ý CUỐI CÙNG:
                     # Kiểm tra cờ stop_processing sau khi chạy text_extraction
                     if state.get("stop_processing", False):
                         log(f"Stopping processing due to: {state.get('stop_reason', 'unknown reason')}", level='warning')
-                        state["chain_of_thought"].append(f"🛑 Dừng xử lý: {state.get('stop_reason', 'Lỗi không xác định')}")
+                        state["chain_of_thought"].append(f"🛑 Stopped: {state.get('stop_reason', 'Unknown error')}")
                         break
                         
                 elif agent_name == "file_classification":
@@ -3760,7 +3817,7 @@ LƯU Ý CUỐI CÙNG:
                 # Kiểm tra cờ stop_processing sau khi chạy bất kỳ agent nào
                 if state.get("stop_processing", False):
                     log(f"Stopping processing due to: {state.get('stop_reason', 'unknown reason')}", level='warning')
-                    state["chain_of_thought"].append(f"🛑 Dừng xử lý: {state.get('stop_reason', 'Lỗi không xác định')}")
+                    state["chain_of_thought"].append(f"🛑 Stopped: {state.get('stop_reason', 'Unknown error')}")
                     break
                 
                 # Lấy kết quả mới nhất từ agent
@@ -3771,18 +3828,18 @@ LƯU Ý CUỐI CÙNG:
                         summary = latest_message[:197] + "..."
                     else:
                         summary = latest_message
-                    state["chain_of_thought"].append(f"✨{step_count}a. Kết quả từ {agent_name}: {summary}")
+                    state["chain_of_thought"].append(f"✨{step_count}a. Result from {agent_name}: {summary}")
                 
                 step_count += 1
             
             # Run reflection agent to create final response
             log("Running reflection agent for final response...")
-            state["chain_of_thought"].append(f"🤔{step_count}. Đang tạo câu trả lời cuối cùng...")
+            state["chain_of_thought"].append(f"🤔{step_count}. Generating final response...")
             state = await self.run_reflection_agent(state)
             
             # Mark as completed
             state["completed"] = True
-            state["chain_of_thought"].append(f"🚀{step_count + 1}. Hoàn thành xử lý")
+            state["chain_of_thought"].append(f"🚀{step_count + 1}. Processing complete")
             
             # # Generate execution summary
             # agent_summary = ""
@@ -3801,26 +3858,54 @@ LƯU Ý CUỐI CÙNG:
                     final_reflection_content = message.content[2:].strip()  # Remove 💭 emoji
                     break
             
+            content = final_reflection_content if final_reflection_content else state["messages"][-1].content
+            
+            # Run online LLM-as-judge evaluations (non-blocking)
+            eval_results = {}
+            try:
+                from config.opik_eval import run_online_evaluations
+                _elapsed = _time_mod.time() - _run_start_time
+                eval_results = await run_online_evaluations(
+                    query=query,
+                    response=content,
+                    agents_used=state.get("used_tools", []),
+                    agent_results=state.get("agent_results", {}),
+                    chain_of_thought=state.get("chain_of_thought", []),
+                    elapsed_time=_elapsed,
+                )
+                if eval_results:
+                    eval_summary = ', '.join(f'{k}={v.get("score", 0):.0%}' for k, v in eval_results.items())
+                    log(f"Online evaluations completed: {eval_summary}")
+                    # Log feedback scores to current Opik trace (must be inside @opik_track decorated function)
+                    try:
+                        from config.opik_eval import log_feedback_to_current_trace
+                        log_feedback_to_current_trace(eval_results)
+                    except Exception as fb_err:
+                        log(f"Feedback score logging skipped: {fb_err}", level='warning')
+            except Exception as eval_err:
+                log(f"Online evaluation skipped: {eval_err}", level='warning')
+            
             # Return the final state with reflection as main content
             return {
                 "response_type": "data",
                 "is_task_complete": True,
                 "require_user_input": False,
-                "content": final_reflection_content if final_reflection_content else state["messages"][-1].content,
+                "content": content,
                 "state": state,
                 "chain_of_thought": state["chain_of_thought"],
                 "agent_execution_order": state.get("agent_execution_order", []),
                 "used_tools": state.get("used_tools", []),
-                "agent_results": state.get("agent_results", {})
+                "agent_results": state.get("agent_results", {}),
+                "eval_results": eval_results,
             }
         except Exception as e:
             log(f"Error running multi-agent system: {e}", level='error')
             return {
                 "response_type": "error",
-                "content": f"Xin lỗi, đã xảy ra lỗi: {str(e)}",
+                "content": f"Sorry, an error occurred: {str(e)}",
                 "is_task_complete": False,
                 "require_user_input": False,
-                "chain_of_thought": [f"❌Lỗi: {str(e)}"]
+                "chain_of_thought": [f"❌ Error: {str(e)}"]
             }
              
     async def stream(self, query: str, session_id: str = "default", user_role: str = "user") -> AsyncGenerator[Dict[str, Any], None]:
@@ -3865,7 +3950,7 @@ LƯU Ý CUỐI CÙNG:
                     # Find the latest non-evaluator message
                     latest_message = None
                     for message in reversed(chunk["messages"]):
-                        if isinstance(message, AIMessage) and not message.content.startswith("[Đánh giá nội bộ:"):
+                        if isinstance(message, AIMessage) and not message.content.startswith("[Đánh giá nội bộ:") and not message.content.startswith("[Internal evaluation:"):
                             latest_message = message
                             break
                     
@@ -3898,12 +3983,12 @@ LƯU Ý CUỐI CÙNG:
             # If no reflection found, use the last non-evaluator message
             if not final_message:
                 for message in reversed(final_state["messages"]):
-                    if isinstance(message, AIMessage) and not message.content.startswith("[Đánh giá nội bộ:"):
+                    if isinstance(message, AIMessage) and not message.content.startswith("[Đánh giá nội bộ:") and not message.content.startswith("[Internal evaluation:"):
                         final_message = message
                         break
             
             if not final_message:
-                final_message = final_state["messages"][-1] if final_state["messages"] else AIMessage(content="Không có phản hồi từ hệ thống.")
+                final_message = final_state["messages"][-1] if final_state["messages"] else AIMessage(content="No response from the system.")
             
             # Extract content, removing emoji if it's a reflection
             content = final_message.content
@@ -3924,7 +4009,7 @@ LƯU Ý CUỐI CÙNG:
             print(f"Error streaming multi-agent system: {e}")
             yield {
                 "response_type": "error",
-                "content": f"Xin lỗi, đã xảy ra lỗi: {str(e)}",
+                "content": f"Sorry, an error occurred: {str(e)}",
                 "is_task_complete": False,
                 "require_user_input": False,
                 "is_partial": False

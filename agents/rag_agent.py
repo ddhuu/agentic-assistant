@@ -48,7 +48,7 @@ class RAGAgent(BaseAgent):
         api_key = google_api_key or security_config.google_api_key
         
         self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
+            model="models/gemini-embedding-001",
             google_api_key=api_key
         )
         
@@ -66,7 +66,7 @@ class RAGAgent(BaseAgent):
         self._file_hash_cache = {}
         
         # Store the embeddings model type for cache validation
-        self.embeddings_model = "google-embedding-001"
+        self.embeddings_model = "google-gemini-embedding-001"
         
     @property
     def name(self):
